@@ -1,0 +1,191 @@
+// SmartQR Prisma Schema
+// Spec §7 & §8
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ============================================================================
+// Phase 1: Authentication & User Domain
+// ============================================================================
+
+model User {
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  passwordHash String
+  avatarUrl    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // Phase 1 relations
+  passwordResetTokens PasswordResetToken[]
+
+  // Phase 2 relations
+  qrCodes QRCode[]
+
+  // Phase 5 relations
+  storedFiles StoredFile[]
+
+  @@map("users")
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@map("password_reset_tokens")
+}
+
+// ============================================================================
+// Phase 2: QR Code Core
+// ============================================================================
+
+enum QRType {
+  URL
+  MAP
+  PHONE
+  EMAIL
+  CONTACT
+  WHATSAPP
+  WIFI
+  TEXT
+  FILE
+  MULTI_LINK
+}
+
+enum QRStatus {
+  ACTIVE
+  DISABLED
+  EXPIRED
+  DELETED
+}
+
+model QRCode {
+  id        String    @id @default(cuid())
+  userId    String
+  shortCode String    @unique
+  name      String
+  type      QRType    @default(URL)
+  data      Json      // Phase 3+ will validate per-type with Zod; Phase 2 accepts any JSON
+  status    QRStatus  @default(ACTIVE)
+  isDynamic Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user  User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  design QRDesign?
+  scanEvents ScanEvent[]
+  multiLinkPage MultiLinkPage?
+
+  @@index([userId])
+  @@index([type])
+  @@index([status])
+  @@map("qr_codes")
+}
+
+model ScanEvent {
+  id         String   @id @default(cuid())
+  qrCodeId   String
+  ipAddress  String?
+  deviceType String?  // "mobile" | "desktop" | "tablet"
+  browser    String?
+  os         String?
+  referer    String?
+  scannedAt  DateTime @default(now())
+
+  qrCode QRCode @relation(fields: [qrCodeId], references: [id], onDelete: Cascade)
+
+  @@index([qrCodeId])
+  @@index([scannedAt])
+  @@map("scan_events")
+}
+
+model QRDesign {
+  id                   String   @id @default(cuid())
+  qrCodeId             String   @unique
+  foregroundColor       String?
+  backgroundColor      String?
+  dotStyle             String?
+  cornerStyle          String?
+  eyeStyle             String?
+  frameStyle           String?
+  frameText            String?
+  logoFileId           String?
+  errorCorrectionLevel String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  qrCode QRCode @relation(fields: [qrCodeId], references: [id], onDelete: Cascade)
+
+  @@map("qr_designs")
+}
+
+// ============================================================================
+// Phase 6: Multi-Link Landing Pages
+// ============================================================================
+
+model MultiLinkPage {
+  id          String   @id @default(cuid())
+  qrCodeId    String   @unique
+  title       String?
+  description String?
+  theme       String   @default("default") // "default" | "minimal" | "dark"
+  logoFileId  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  qrCode QRCode       @relation(fields: [qrCodeId], references: [id], onDelete: Cascade)
+  items  MultiLinkItem[]
+
+  @@map("multi_link_pages")
+}
+
+model MultiLinkItem {
+  id        String  @id @default(cuid())
+  pageId    String
+  label     String
+  url       String
+  icon      String? // emoji or icon name
+  sortOrder Int     @default(0)
+  enabled   Boolean @default(true)
+
+  page MultiLinkPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@index([pageId])
+  @@index([pageId, sortOrder])
+  @@map("multi_link_items")
+}
+
+// ============================================================================
+// Phase 5: File Storage
+// ============================================================================
+
+model StoredFile {
+  id           String   @id @default(cuid())
+  userId       String
+  storageKey   String   @unique   // physical filename (UUID-based), never exposes original name
+  originalName String            // display/download name
+  mimeType     String            // verified MIME type (sniffed, not user-supplied)
+  sizeBytes    BigInt            // file size in bytes
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("stored_files")
+}
