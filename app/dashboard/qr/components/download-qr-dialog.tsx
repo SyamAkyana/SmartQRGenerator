@@ -37,12 +37,13 @@ const DEFAULT_DESIGN: DesignOptions = {
 /** Convert any logo (builtin icon or uploaded file) into a clean base64 data URI for safe export. */
 export async function resolveLogoDataUri(logoFileId?: string | null): Promise<string | undefined> {
   if (!logoFileId) return undefined;
+  if (logoFileId.startsWith("data:")) return logoFileId;
   if (isBuiltinIcon(logoFileId)) {
     return getBuiltinIconDataUri(logoFileId);
   }
   try {
-    const res = await fetch(`/api/file/${logoFileId}?publicLogo=1`);
-    const targetRes = res.ok ? res : await fetch(`/api/file/${logoFileId}`);
+    const res = await fetch(`/api/file/${logoFileId}?publicLogo=1`, { credentials: "same-origin" });
+    const targetRes = res.ok ? res : await fetch(`/api/file/${logoFileId}`, { credentials: "same-origin" });
     if (!targetRes.ok) return undefined;
     const blob = await targetRes.blob();
     return new Promise((resolve) => {
@@ -102,6 +103,18 @@ export function DownloadQrDialog({ qr, design: initialDesign, onOpenChange }: Do
     setDownloading(true);
     setErrorMessage(null);
 
+    // Create a temporary hidden container attached to the DOM for reliable rendering
+    const container = document.createElement("div");
+    container.style.position = "fixed";
+    container.style.left = "-99999px";
+    container.style.top = "-99999px";
+    container.style.width = `${resolution}px`;
+    container.style.height = `${resolution}px`;
+    container.style.overflow = "hidden";
+    container.style.opacity = "0";
+    container.style.pointerEvents = "none";
+    document.body.appendChild(container);
+
     try {
       const content = getQrContent(qr) || "https://smartqr.example";
       const filename = getExportFilename(qr.name, format);
@@ -144,93 +157,124 @@ export function DownloadQrDialog({ qr, design: initialDesign, onOpenChange }: Do
           : {}),
       };
 
+      let exported = false;
+
       if (format === "svg") {
         const svgInstance = new QRCodeStyling({
           ...qrOptions,
           type: "svg",
         });
+        svgInstance.append(container);
 
-        const svgBlob = (await svgInstance.getRawData("svg")) as Blob | null;
-        if (svgBlob && svgBlob instanceof Blob) {
-          triggerBlobDownload(svgBlob, `${cleanName}.svg`);
+        if (svgInstance._svgDrawingPromise) {
+          try {
+            await Promise.race([
+              svgInstance._svgDrawingPromise,
+              new Promise((resolve) => setTimeout(resolve, 2500)),
+            ]);
+          } catch {
+            // Continue with fallback
+          }
         } else {
-          await svgInstance.download({ name: cleanName, extension: "svg" });
+          await new Promise((resolve) => setTimeout(resolve, 150));
+        }
+
+        const svgEl = container.querySelector("svg");
+        if (svgEl) {
+          svgEl.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+          svgEl.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+          const serializer = new XMLSerializer();
+          let svgString = serializer.serializeToString(svgEl);
+          if (!svgString.startsWith("<?xml")) {
+            svgString = '<?xml version="1.0" standalone="no"?>\r\n' + svgString;
+          }
+          const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+          triggerBlobDownload(svgBlob, `${cleanName}.svg`);
+          exported = true;
+        }
+
+        if (!exported) {
+          const rawSvg = await svgInstance.getRawData("svg");
+          if (rawSvg && rawSvg instanceof Blob) {
+            triggerBlobDownload(rawSvg, `${cleanName}.svg`);
+            exported = true;
+          } else {
+            await svgInstance.download({ name: cleanName, extension: "svg" });
+            exported = true;
+          }
         }
       } else {
-        // PNG export
-        let exported = false;
-
-        // Strategy 1: canvas getRawData
+        // PNG Export — Multi-strategy pipeline
+        // Strategy 1: Render canvas in off-screen DOM container
         try {
           const canvasInstance = new QRCodeStyling({
             ...qrOptions,
             type: "canvas",
           });
+          canvasInstance.append(container);
 
-          const pngBlob = await Promise.race([
-            canvasInstance.getRawData("png") as Promise<Blob | null>,
-            new Promise<null>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 4000)),
-          ]);
+          if (canvasInstance._canvasDrawingPromise) {
+            await Promise.race([
+              canvasInstance._canvasDrawingPromise,
+              new Promise((resolve) => setTimeout(resolve, 2500)),
+            ]);
+          } else {
+            await new Promise((resolve) => setTimeout(resolve, 200));
+          }
 
-          if (pngBlob && pngBlob instanceof Blob && pngBlob.size > 100) {
-            triggerBlobDownload(pngBlob, `${cleanName}.png`);
-            exported = true;
+          const canvasEl = container.querySelector("canvas");
+          if (canvasEl) {
+            const pngBlob = await new Promise<Blob | null>((resolve) => {
+              canvasEl.toBlob((b) => resolve(b), "image/png");
+            });
+
+            if (pngBlob && pngBlob.size > 100) {
+              triggerBlobDownload(pngBlob, `${cleanName}.png`);
+              exported = true;
+            }
           }
         } catch {
-          // Fallback to Strategy 2
+          // Fallback to next strategy
         }
 
-        // Strategy 2: Render SVG to offscreen canvas
+        // Strategy 2: Raw data extraction with timeout
         if (!exported) {
-          const svgInstance = new QRCodeStyling({
-            ...qrOptions,
-            type: "svg",
-          });
-          const rawSvgBlob = (await svgInstance.getRawData("svg")) as Blob | null;
-
-          if (rawSvgBlob && rawSvgBlob instanceof Blob) {
-            const svgText = await rawSvgBlob.text();
-            const svgDataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgText)}`;
-
-            await new Promise<void>((resolve, reject) => {
-              const img = new Image();
-              img.onload = () => {
-                try {
-                  const canvas = document.createElement("canvas");
-                  canvas.width = resolution;
-                  canvas.height = resolution;
-                  const ctx = canvas.getContext("2d");
-                  if (!ctx) return reject(new Error("Canvas context failed"));
-                  ctx.fillStyle = design.backgroundColor || "#ffffff";
-                  ctx.fillRect(0, 0, resolution, resolution);
-                  ctx.drawImage(img, 0, 0, resolution, resolution);
-                  canvas.toBlob((blob) => {
-                    if (blob) {
-                      triggerBlobDownload(blob, `${cleanName}.png`);
-                      exported = true;
-                      resolve();
-                    } else {
-                      reject(new Error("toBlob failed"));
-                    }
-                  }, "image/png");
-                } catch (e) {
-                  reject(e);
-                }
-              };
-              img.onerror = () => reject(new Error("SVG Image rasterization failed"));
-              img.src = svgDataUrl;
+          try {
+            const fallbackInstance = new QRCodeStyling({
+              ...qrOptions,
+              type: "canvas",
             });
+            const pngBlob = await Promise.race([
+              fallbackInstance.getRawData("png") as Promise<Blob | null>,
+              new Promise<null>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 3000)),
+            ]);
+
+            if (pngBlob && pngBlob instanceof Blob && pngBlob.size > 100) {
+              triggerBlobDownload(pngBlob, `${cleanName}.png`);
+              exported = true;
+            }
+          } catch {
+            // Fallback to next strategy
           }
         }
 
-        // Strategy 3: Built-in download method
+        // Strategy 3: Built-in library download trigger
         if (!exported) {
-          const fallbackInstance = new QRCodeStyling({
-            ...qrOptions,
-            type: "canvas",
-          });
-          await fallbackInstance.download({ name: cleanName, extension: "png" });
+          try {
+            const downloadInstance = new QRCodeStyling({
+              ...qrOptions,
+              type: "canvas",
+            });
+            await downloadInstance.download({ name: cleanName, extension: "png" });
+            exported = true;
+          } catch {
+            // Continue
+          }
         }
+      }
+
+      if (!exported) {
+        throw new Error("Unable to export QR code. Please try a different resolution or format.");
       }
 
       setDownloaded(true);
@@ -238,6 +282,9 @@ export function DownloadQrDialog({ qr, design: initialDesign, onOpenChange }: Do
     } catch (err: any) {
       setErrorMessage(err?.message || "Failed to download QR code. Please try again.");
     } finally {
+      if (document.body.contains(container)) {
+        document.body.removeChild(container);
+      }
       setDownloading(false);
     }
   }
