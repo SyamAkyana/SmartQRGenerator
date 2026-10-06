@@ -82,6 +82,17 @@ function getContrastRatio(fg: string, bg: string): number {
   }
 }
 
+function triggerBlobDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export function InstantQrGenerator() {
   const [activeTab, setActiveTab] = useState<TabType>("url");
   const [proModalFeature, setProModalFeature] = useState<ProTabType | null>(null);
@@ -226,23 +237,107 @@ export function InstantQrGenerator() {
 
   // Export handlers
   const handleDownload = async (extension: "png" | "svg") => {
-    const exportInstance = new QRCodeStyling({
-      width: 1024,
-      height: 1024,
-      type: extension === "svg" ? "svg" : "canvas",
-      data: currentPayload,
-      margin: 24,
-      qrOptions: { errorCorrectionLevel: "H" },
-      dotsOptions: { color: fgColor, type: dotStyle },
-      backgroundOptions: { color: bgColor },
-      cornersSquareOptions: { color: fgColor, type: cornerStyle },
-      cornersDotOptions: { color: fgColor, type: cornerDotStyle },
-    });
+    const container = document.createElement("div");
+    container.style.position = "fixed";
+    container.style.left = "-99999px";
+    container.style.top = "-99999px";
+    container.style.width = "1024px";
+    container.style.height = "1024px";
+    container.style.overflow = "hidden";
+    container.style.opacity = "0";
+    container.style.pointerEvents = "none";
+    document.body.appendChild(container);
 
-    await exportInstance.download({
-      name: `smartqr-static-${activeTab}`,
-      extension,
-    });
+    const filename = `smartqr-static-${activeTab}.${extension}`;
+    const cleanName = `smartqr-static-${activeTab}`;
+
+    try {
+      const exportInstance = new QRCodeStyling({
+        width: 1024,
+        height: 1024,
+        type: extension === "svg" ? "svg" : "canvas",
+        data: currentPayload,
+        margin: 24,
+        qrOptions: { errorCorrectionLevel: "H" },
+        dotsOptions: { color: fgColor, type: dotStyle },
+        backgroundOptions: { color: bgColor },
+        cornersSquareOptions: { color: fgColor, type: cornerStyle },
+        cornersDotOptions: { color: fgColor, type: cornerDotStyle },
+      });
+
+      exportInstance.append(container);
+
+      if (extension === "svg") {
+        if (exportInstance._svgDrawingPromise) {
+          try {
+            await Promise.race([
+              exportInstance._svgDrawingPromise,
+              new Promise((resolve) => setTimeout(resolve, 2000)),
+            ]);
+          } catch {
+            // Continue
+          }
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+
+        const svgEl = container.querySelector("svg");
+        if (svgEl) {
+          svgEl.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+          const serializer = new XMLSerializer();
+          let svgString = serializer.serializeToString(svgEl);
+          if (!svgString.startsWith("<?xml")) {
+            svgString = '<?xml version="1.0" standalone="no"?>\r\n' + svgString;
+          }
+          const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+          triggerBlobDownload(svgBlob, filename);
+        } else {
+          await exportInstance.download({ name: cleanName, extension: "svg" });
+        }
+      } else {
+        // PNG export
+        if (exportInstance._canvasDrawingPromise) {
+          try {
+            await Promise.race([
+              exportInstance._canvasDrawingPromise,
+              new Promise((resolve) => setTimeout(resolve, 2000)),
+            ]);
+          } catch {
+            // Continue
+          }
+        } else {
+          await new Promise((resolve) => setTimeout(resolve, 150));
+        }
+
+        const canvasEl = container.querySelector("canvas");
+        if (canvasEl) {
+          const pngBlob = await new Promise<Blob | null>((resolve) => {
+            canvasEl.toBlob((b) => resolve(b), "image/png");
+          });
+          if (pngBlob && pngBlob.size > 100) {
+            triggerBlobDownload(pngBlob, filename);
+          } else {
+            await exportInstance.download({ name: cleanName, extension: "png" });
+          }
+        } else {
+          await exportInstance.download({ name: cleanName, extension: "png" });
+        }
+      }
+    } catch {
+      // Fallback to library download method
+      const fallback = new QRCodeStyling({
+        width: 1024,
+        height: 1024,
+        type: extension === "svg" ? "svg" : "canvas",
+        data: currentPayload,
+        margin: 24,
+      });
+      await fallback.download({ name: cleanName, extension });
+    } finally {
+      if (document.body.contains(container)) {
+        document.body.removeChild(container);
+      }
+    }
   };
 
   const handleCopyPayload = () => {
