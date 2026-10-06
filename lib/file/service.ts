@@ -198,7 +198,7 @@ export async function storeFile(
   // 5. Store physical file (UUID-based name)
   const storageKey = await storage.store(userId, buffer, ext);
 
-  // 6. Create DB record
+  // 6. Create DB record with binary payload for serverless/database storage
   const storedFile = await prisma.storedFile.create({
     data: {
       userId,
@@ -206,6 +206,7 @@ export async function storeFile(
       originalName: sanitizeFilename(originalName),
       mimeType: sniffedMime,
       sizeBytes: buffer.length,
+      fileData: new Uint8Array(buffer),
     },
   });
 

@@ -12,6 +12,8 @@ import {
   rateLimitResponse,
 } from "@/lib/security/rate-limit";
 
+export const dynamic = "force-dynamic";
+
 /** POST /api/file — upload a file */
 export async function POST(req: NextRequest) {
   const session = await auth();

@@ -182,6 +182,7 @@ model StoredFile {
   originalName String            // display/download name
   mimeType     String            // verified MIME type (sniffed, not user-supplied)
   sizeBytes    BigInt            // file size in bytes
+  fileData     Bytes?            // binary file payload for database storage (Vercel / Serverless compatible)
   createdAt    DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)

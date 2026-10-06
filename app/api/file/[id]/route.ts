@@ -5,28 +5,23 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
-import { getFile, deleteFile } from "@/lib/file/service";
+import { deleteFile } from "@/lib/file/service";
 import { storage } from "@/lib/storage";
 import { prisma } from "@/lib/db/prisma";
-import fs from "node:fs";
+
+export const dynamic = "force-dynamic";
 
 /** Check if a file is used as a logo on any QR (MULTI_LINK pages or QRDesign). */
-async function isLogoOwnedByQr(fileId: string, requestingUserId?: string): Promise<boolean> {
+async function isLogoOwnedByQr(fileId: string): Promise<boolean> {
   const page = await prisma.multiLinkPage.findFirst({
     where: { logoFileId: fileId },
-    include: { qrCode: { select: { userId: true } } },
   });
-  if (page) {
-    return !requestingUserId || page.qrCode.userId === requestingUserId;
-  }
+  if (page) return true;
 
   const design = await prisma.qRDesign.findFirst({
     where: { logoFileId: fileId },
-    include: { qrCode: { select: { userId: true } } },
   });
-  if (design) {
-    return !requestingUserId || design.qrCode.userId === requestingUserId;
-  }
+  if (design) return true;
 
   return false;
 }
@@ -59,7 +54,7 @@ async function isFileAttachedToActiveQr(fileId: string, shortCode?: string | nul
   });
 }
 
-/** GET /api/file/[id] — serve file for download */
+/** GET /api/file/[id] — serve file for download / display */
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -69,128 +64,73 @@ export async function GET(
   const isPublicLogo = req.nextUrl.searchParams.get("publicLogo") === "1";
   const qrParam = req.nextUrl.searchParams.get("qr");
 
-  // Public logo mode: no auth required, but must be a logo on a QR page
-  if (isPublicLogo) {
-    const isAllowed = await isLogoOwnedByQr(id, session?.user?.id);
-    if (!isAllowed) {
-      return NextResponse.json(
-        { success: false, error: { code: "FORBIDDEN", message: "Logo not accessible" } },
-        { status: 403 },
-      );
-    }
-
-    const storedFile = await prisma.storedFile.findUnique({ where: { id } });
-    if (!storedFile) {
-      return NextResponse.json(
-        { success: false, error: { code: "NOT_FOUND", message: "File not found" } },
-        { status: 404 },
-      );
-    }
-
-    const filePath = storage.getPath(storedFile.storageKey);
-    if (!fs.existsSync(filePath)) {
-      return NextResponse.json(
-        { success: false, error: { code: "NOT_FOUND", message: "File missing from storage" } },
-        { status: 404 },
-      );
-    }
-
-    const fileBuffer = await storage.retrieve(storedFile.storageKey);
-    if (!fileBuffer) {
-      return NextResponse.json(
-        { success: false, error: { code: "NOT_FOUND", message: "File missing from storage" } },
-        { status: 404 },
-      );
-    }
-
-    const isImage = storedFile.mimeType.startsWith("image/");
-    return new NextResponse(new Uint8Array(fileBuffer), {
-      headers: {
-        "Content-Type": storedFile.mimeType,
-        "Content-Disposition": isImage ? "inline" : `attachment; filename="${storedFile.originalName}"`,
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=86400",
-      },
-    });
-  }
-
-  // Public file mode for active FILE QR codes: no user session required
-  const isPublicFile = await isFileAttachedToActiveQr(id, qrParam);
-  if (!session?.user?.id && isPublicFile) {
-    const storedFile = await prisma.storedFile.findUnique({ where: { id } });
-    if (!storedFile) {
-      return NextResponse.json(
-        { success: false, error: { code: "NOT_FOUND", message: "File not found" } },
-        { status: 404 },
-      );
-    }
-
-    const filePath = storage.getPath(storedFile.storageKey);
-    if (!fs.existsSync(filePath)) {
-      return NextResponse.json(
-        { success: false, error: { code: "NOT_FOUND", message: "File missing from storage" } },
-        { status: 404 },
-      );
-    }
-
-    const fileBuffer = await storage.retrieve(storedFile.storageKey);
-    if (!fileBuffer) {
-      return NextResponse.json(
-        { success: false, error: { code: "NOT_FOUND", message: "File missing from storage" } },
-        { status: 404 },
-      );
-    }
-
-    return new NextResponse(new Uint8Array(fileBuffer), {
-      headers: {
-        "Content-Type": storedFile.mimeType,
-        "Content-Disposition": `attachment; filename="${storedFile.originalName}"`,
-        "Content-Length": String(storedFile.sizeBytes),
-        "Cache-Control": "public, max-age=3600",
-      },
-    });
-  }
-
-  // Authenticated mode: must own the file
-  if (!session?.user?.id) {
-    return NextResponse.json(
-      { success: false, error: { code: "UNAUTHORIZED", message: "Unauthorized" } },
-      { status: 401 },
-    );
-  }
-
-  const record = await getFile(id, session.user.id);
-  if (!record) {
+  // 1. Fetch file record from database
+  const storedFile = await prisma.storedFile.findUnique({ where: { id } });
+  if (!storedFile) {
     return NextResponse.json(
       { success: false, error: { code: "NOT_FOUND", message: "File not found" } },
       { status: 404 },
     );
   }
 
-  const authFilePath = storage.getPath(record.storageKey);
-  if (!fs.existsSync(authFilePath)) {
+  // 2. Authorization check
+  const isOwner = session?.user?.id && session.user.id === storedFile.userId;
+  let isAuthorized = false;
+  let cacheHeader = "private, max-age=3600";
+
+  if (isOwner) {
+    isAuthorized = true;
+  } else if (isPublicLogo) {
+    const isLinkedToQr = await isLogoOwnedByQr(id);
+    if (isLinkedToQr) {
+      isAuthorized = true;
+      cacheHeader = "public, max-age=86400, stale-while-revalidate=604800";
+    }
+  } else {
+    const isPublicFile = await isFileAttachedToActiveQr(id, qrParam);
+    if (isPublicFile) {
+      isAuthorized = true;
+      cacheHeader = "public, max-age=3600";
+    }
+  }
+
+  if (!isAuthorized) {
+    if (!session?.user?.id) {
+      return NextResponse.json(
+        { success: false, error: { code: "UNAUTHORIZED", message: "Authentication required" } },
+        { status: 401 },
+      );
+    }
+    return NextResponse.json(
+      { success: false, error: { code: "FORBIDDEN", message: "File access forbidden" } },
+      { status: 403 },
+    );
+  }
+
+  // 3. Retrieve binary payload (Database first for Serverless/Vercel, Local storage fallback)
+  let fileBuffer: Buffer | Uint8Array | null = storedFile.fileData;
+  if (!fileBuffer) {
+    fileBuffer = await storage.retrieve(storedFile.storageKey);
+  }
+
+  if (!fileBuffer || fileBuffer.length === 0) {
     return NextResponse.json(
       { success: false, error: { code: "NOT_FOUND", message: "File missing from storage" } },
       { status: 404 },
     );
   }
 
-  const authFileBuffer = await storage.retrieve(record.storageKey);
-  if (!authFileBuffer) {
-    return NextResponse.json(
-      { success: false, error: { code: "NOT_FOUND", message: "File missing from storage" } },
-      { status: 404 },
-    );
-  }
-
-  const isImage = record.mimeType.startsWith("image/");
-  return new NextResponse(new Uint8Array(authFileBuffer), {
+  // 4. Return binary response with appropriate headers
+  const isImage = storedFile.mimeType.startsWith("image/");
+  return new NextResponse(new Uint8Array(fileBuffer), {
     headers: {
-      "Content-Type": record.mimeType,
-      "Content-Disposition": isImage ? `inline; filename="${record.originalName}"` : `attachment; filename="${record.originalName}"`,
-      "Content-Length": String(record.sizeBytes),
+      "Content-Type": storedFile.mimeType,
+      "Content-Disposition": isImage
+        ? `inline; filename="${storedFile.originalName}"`
+        : `attachment; filename="${storedFile.originalName}"`,
+      "Content-Length": String(storedFile.sizeBytes),
       "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "private, no-cache",
+      "Cache-Control": cacheHeader,
     },
   });
 }
